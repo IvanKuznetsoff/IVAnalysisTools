@@ -1,14 +1,9 @@
 name = "IVAnalysisTools"
 uuid = "21f541d1-f501-4d2f-911f-54a46ea34503"
 version = "0.1.0"
-authors = ["John Doe <shunsuke.nishimura.t2@alumni.tohoku.ac.jp>"]
+authors = ["John Doe"]
 
 [deps]
 Dierckx = "39dd38d3-220a-591b-8e3c-4c3a8c710a94"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
-
-[compat]
-Dierckx = "0.5.4"
-FFTW = "1.10.0"
-StatsBase = "0.34.13"
