@@ -579,5 +579,9 @@ module IVAnalysisTools
         return (; filtered, lowpass, strength)
     end
 
+    include("compression.jl")
+    using .CompressV2: process_mat_file, process_mat_folder
+
     export blockmean, hann_decimate, initialize_phase, remove_offset!, remove_residual_resistance!, PairedArray, local_line, detect_edges, edge_local_fir
+    export process_mat_file, process_mat_folder
 end
