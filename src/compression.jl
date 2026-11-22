@@ -6,6 +6,7 @@ Convert MATLAB v7.3 measurement files to HDF5.
         "RQSN_Nb-Si-irr-B5B8/01_IVT-5sec/data_01_1.8K_14_15-26-11.mat",
         "RQSN_Nb-Si-irr-B5B8_c/01_IVT-5sec";
         compression = :dictionary_delta,
+        file_as_folder = true,
     )
 
     # Load IVAnalysisTools in each Julia process that reads the result.
@@ -13,7 +14,7 @@ Convert MATLAB v7.3 measurement files to HDF5.
 
     # Recursively convert all measurement folders, retaining their directory tree.
     process_mat_folder("RQSN_Nb-Si-irr-B5B8", "RQSN_Nb-Si-irr-B5B8_c";
-        compression = :dictionary_delta)
+        compression = :dictionary_delta, file_as_folder = true)
 
 With `:dictionary_delta`, waveform datasets retain their floating-point type,
 shape, and exact bits. Each chunk stores a dictionary of the original values
@@ -384,10 +385,15 @@ function rebuild_references!(destination, source, paths)
 end
 
 """
-    process_mat_file(mat_path, output_directory; compression=:blosc, ...)
+    process_mat_file(mat_path, output_directory; compression=:blosc,
+                     file_as_folder=false, ...)
 
-Write a new .h5 file and return its path. Use `compression=:dictionary_delta`
-for bit-exact waveforms. Its defaults are `compression_level=7` and
+Write a new .h5 file and return its path. For `measurement.mat`, the default
+destination is `output_directory/measurement.h5`. Set `file_as_folder=true`
+to write `output_directory/measurement/raw.h5`.
+
+Use `compression=:dictionary_delta` for bit-exact waveforms. Its defaults are
+`compression_level=7` and
 `target_chunk_bytes=8_000_000` (one million Float64 samples). Load `IVAnalysisTools`
 before opening the result with `h5read`. The legacy `:blosc`, `:deflate`, and
 `:none` modes default to `compression_level=5` and `target_chunk_bytes=1<<20`.
@@ -401,6 +407,7 @@ function process_mat_file(
     blosc_compressor::AbstractString = "blosclz",
     target_chunk_bytes::Integer = compression === :dictionary_delta ? 8_000_000 : 1 << 20,
     minimum_compression_bytes::Integer = 1024,
+    file_as_folder::Bool = false,
     overwrite::Bool = false,
 )
     isfile(mat_path) || throw(ArgumentError("Input file does not exist: $mat_path"))
@@ -413,14 +420,18 @@ function process_mat_file(
         throw(ArgumentError("target_chunk_bytes exceeds the dictionary filter's 64 MiB limit."))
     end
     filters = compression_filters(compression; compression_level, blosc_compressor)
-    mkpath(output_directory)
-    output_path = joinpath(output_directory, splitext(basename(mat_path))[1] * ".h5")
-    realpath(mat_path) == joinpath(realpath(output_directory), basename(output_path)) &&
+    stem = splitext(basename(mat_path))[1]
+    output_path = file_as_folder ? joinpath(output_directory, stem, "raw.h5") :
+        joinpath(output_directory, stem * ".h5")
+    output_parent = dirname(output_path)
+    mkpath(output_parent)
+    realpath(mat_path) == joinpath(realpath(output_parent), basename(output_path)) &&
         throw(ArgumentError("Input and output must be different files."))
-    ispath(output_path) && !overwrite &&
+    isdir(output_path) && throw(ArgumentError("Output path is a directory: $output_path"))
+    (ispath(output_path) || islink(output_path)) && !overwrite &&
         throw(ArgumentError("Output already exists: $output_path (use overwrite=true)."))
 
-    temporary_path, io = mktemp(output_directory)
+    temporary_path, io = mktemp(output_parent)
     close(io)
     try
         h5open(mat_path, "r") do source
@@ -463,17 +474,21 @@ function process_mat_file(
 end
 
 """
-    process_mat_folder(input_directory, output_directory; recursive=true, kwargs...)
+    process_mat_folder(input_directory, output_directory; recursive=true,
+                       file_as_folder=false, kwargs...)
 
 Convert .mat files sequentially, skipping AppleDouble ._* sidecar files.
-Subdirectories retain their relative paths. Return (succeeded, failed), as in
-v1; failed maps source paths to error messages. Originals are never modified.
+Subdirectories retain their relative paths. With `file_as_folder=true`,
+`input_directory/sub/measurement.mat` becomes
+`output_directory/sub/measurement/raw.h5`. The result contains `succeeded`
+output paths and `failed` error messages keyed by source path.
 Set recursive=false to process only the specified directory.
 """
 function process_mat_folder(
     input_directory::AbstractString,
     output_directory::AbstractString;
     recursive::Bool = true,
+    file_as_folder::Bool = false,
     kwargs...,
 )
     isdir(input_directory) ||
@@ -495,7 +510,7 @@ function process_mat_folder(
         relative_directory = relpath(dirname(path), input_directory)
         target_directory = joinpath(output_directory, relative_directory)
         try
-            push!(succeeded, process_mat_file(path, target_directory; kwargs...))
+            push!(succeeded, process_mat_file(path, target_directory; file_as_folder, kwargs...))
         catch exception
             exception isa InterruptException && rethrow()
             failed[path] = sprint(showerror, exception)
