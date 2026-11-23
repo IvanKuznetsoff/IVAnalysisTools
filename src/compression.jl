@@ -22,6 +22,12 @@ and a compressed stream of successive dictionary-index differences. An
 incompressible chunk uses the original bytes. Both signal and rawdata are
 retained when present.
 
+With `:quantized_delta`, each calibrated signal uses an absolute error bound
+from `propose_compression_tolerance`. The ADC step defaults to `1/2400` V
+(`adc_lsb_volts`) and the rounding error budget to `noise_fraction=0.10`.
+The output stores each signal's bound in `/compression_v2/max_abs_error`.
+Raw waveforms and signals with unavailable calibration use lossless storage.
+
 The legacy modes `:blosc`, `:deflate`, and `:none` retain their Float32
 conversion and flatten MATLAB row/column waveforms to vectors. In those modes,
 rawdata is omitted only when the same channel has a nonempty numeric signal.
@@ -40,7 +46,7 @@ using ProgressMeter
 using Zstd_jll: libzstd
 import HDF5: API, Filters
 
-export process_mat_file, process_mat_folder
+export process_mat_file, process_mat_folder, propose_compression_tolerance
 
 # Private-use HDF5 filter ID. Keep it and the format tag stable for archived files.
 const DICTIONARY_FILTER_ID = API.H5Z_filter_t(61916)
@@ -67,10 +73,11 @@ function compress_zstd(payload, level)
     return resize!(compressed, size)
 end
 
-function decompress_zstd(compressed)
+function decompress_zstd(compressed; minimum_size = DICTIONARY_HEADER_BYTES,
+                         maximum_size = MAX_DICTIONARY_CHUNK_BYTES)
     size = ccall((:ZSTD_getFrameContentSize, libzstd), UInt64,
         (Ptr{UInt8}, Csize_t), compressed, length(compressed))
-    DICTIONARY_HEADER_BYTES <= size <= MAX_DICTIONARY_CHUNK_BYTES ||
+    minimum_size <= size <= maximum_size ||
         error("Invalid CompressV2 frame size")
     payload = Vector{UInt8}(undef, size)
     actual = ccall((:ZSTD_decompress, libzstd), Csize_t,
@@ -78,6 +85,17 @@ function decompress_zstd(compressed)
         payload, length(payload), compressed, length(compressed))
     actual == size || error("Zstandard decompression failed")
     return payload
+end
+
+function replace_filter_buffer!(input, output, buffer, buffer_size)
+    destination = ccall((:H5allocate_memory, API.libhdf5), Ptr{Cvoid},
+        (Csize_t, API.hbool_t), length(output), false)
+    destination == C_NULL && return 0
+    GC.@preserve output unsafe_copyto!(Ptr{UInt8}(destination), pointer(output), length(output))
+    API.h5_free_memory(input)
+    unsafe_store!(buffer, destination)
+    unsafe_store!(buffer_size, Csize_t(length(output)))
+    return length(output)
 end
 
 function encode_dictionary_chunk(raw, ::Type{Float}, ::Type{Word}, level) where {Float,Word}
@@ -158,14 +176,7 @@ function dictionary_filter(flags::Cuint, setting_count::Csize_t, settings::Ptr{C
             output = decode_dictionary_chunk(source, word_type)
         end
 
-        destination = ccall((:H5allocate_memory, API.libhdf5), Ptr{Cvoid},
-            (Csize_t, API.hbool_t), length(output), false)
-        destination == C_NULL && return 0
-        GC.@preserve output unsafe_copyto!(Ptr{UInt8}(destination), pointer(output), length(output))
-        API.h5_free_memory(input)
-        unsafe_store!(buffer, destination)
-        unsafe_store!(buffer_size, Csize_t(length(output)))
-        return length(output)
+        return replace_filter_buffer!(input, output, buffer, buffer_size)
     catch exception
         @debug "CompressV2 HDF5 filter failed" exception=(exception, catch_backtrace())
         return 0
@@ -175,14 +186,19 @@ end
 Filters.filter_cfunc(::Type{DictionaryDeltaFilter}) = @cfunction(dictionary_filter,
     Csize_t, (Cuint, Csize_t, Ptr{Cuint}, Csize_t, Ptr{Csize_t}, Ptr{Ptr{Cvoid}}))
 
+include("quantized_delta.jl")
+
 function __init__()
-    if API.h5z_filter_avail(DICTIONARY_FILTER_ID)
-        registered = get(Filters.FILTERS, DICTIONARY_FILTER_ID, nothing)
-        registered !== nothing && Filters.filtername(registered) ==
-            Filters.filtername(DictionaryDeltaFilter) && return
-        error("HDF5 filter ID $DICTIONARY_FILTER_ID is already in use")
+    for filter in (DictionaryDeltaFilter, QuantizedDeltaFilter)
+        id = Filters.filterid(filter)
+        if API.h5z_filter_avail(id)
+            registered = get(Filters.FILTERS, id, nothing)
+            registered !== nothing && Filters.filtername(registered) == Filters.filtername(filter) &&
+                continue
+            error("HDF5 filter ID $id is already in use")
+        end
+        Filters.register_filter(filter)
     end
-    Filters.register_filter(DictionaryDeltaFilter)
 end
 
 function compression_filters(
@@ -205,10 +221,10 @@ function compression_filters(
             HDF5.Filters.Shuffle(),
             HDF5.Filters.Deflate(level = compression_level),
         ]
-    elseif compression === :dictionary_delta
+    elseif compression in (:dictionary_delta, :quantized_delta)
         return HDF5.Filters.Filter[DictionaryDeltaFilter(sizeof(Float64), compression_level)]
     end
-    throw(ArgumentError("compression must be :none, :blosc, :deflate, or :dictionary_delta."))
+    throw(ArgumentError("compression must be :none, :blosc, :deflate, :dictionary_delta, or :quantized_delta."))
 end
 
 function choose_chunk_shape(value::AbstractArray, target_chunk_bytes::Integer; fill_chunk = false)
@@ -227,19 +243,25 @@ function choose_chunk_shape(value::AbstractArray, target_chunk_bytes::Integer; f
 end
 
 function write_h5_array!(parent, name, value; filters, target_chunk_bytes,
-                         minimum_compression_bytes, exact_waveforms)
-    stored = !exact_waveforms && ndims(value) == 2 && 1 in size(value) ? vec(value) : value
+                         minimum_compression_bytes, preserve_waveform_type,
+                         max_abs_error = 0.0)
+    stored = !preserve_waveform_type && ndims(value) == 2 && 1 in size(value) ? vec(value) : value
     if stored isa AbstractArray && ndims(stored) > 0 && !isempty(stored) && !isempty(filters) &&
        sizeof(eltype(stored)) * length(stored) >= minimum_compression_bytes
-        dataset_filters = exact_waveforms ?
-            DictionaryDeltaFilter(sizeof(eltype(stored)), only(filters).level) : filters
+        dataset_filters = filters
+        if preserve_waveform_type
+            width = sizeof(eltype(stored))
+            level = only(filters).level
+            dataset_filters = max_abs_error > 0 ? QuantizedDeltaFilter(width, level, max_abs_error) :
+                DictionaryDeltaFilter(width, level)
+        end
         HDF5.write_dataset(parent, name, stored;
-            chunk = choose_chunk_shape(stored, target_chunk_bytes; fill_chunk = exact_waveforms),
+            chunk = choose_chunk_shape(stored, target_chunk_bytes; fill_chunk = preserve_waveform_type),
             filters = dataset_filters)
-    else
-        write(parent, name, stored)
+        return max_abs_error
     end
-    return nothing
+    write(parent, name, stored)
+    return 0.0
 end
 
 # HDF5.copy_object preserves even MATLAB-specific compound and opaque types.
@@ -286,11 +308,12 @@ function usable_signal(group)
 end
 
 function copy_tree!(destination, source, path, references, removed_rawdata,
-                    signal_paths; exact_waveforms, array_options...)
+                    signal_paths, error_bounds; preserve_waveform_type,
+                    quantization, array_options...)
     # Pruning is deliberately local to each channel; a signal in I1 never
     # licenses dropping rawdata in another channel.
     is_channel = path in ("/I1", "/I2", "/V1", "/V2")
-    drop_rawdata = !exact_waveforms && is_channel &&
+    drop_rawdata = !preserve_waveform_type && is_channel &&
         haskey(source, "rawdata") && usable_signal(source)
     copy_attributes!(destination, source;
         omitted_fields = drop_rawdata ? ["rawdata"] : String[])
@@ -307,35 +330,47 @@ function copy_tree!(destination, source, path, references, removed_rawdata,
                 target = create_group(destination, key)
                 try
                     copy_tree!(target, child, child_path, references,
-                        removed_rawdata, signal_paths; exact_waveforms, array_options...)
+                        removed_rawdata, signal_paths, error_bounds;
+                        preserve_waveform_type, quantization, array_options...)
                 finally
                     close(target)
                 end
             elseif child isa HDF5.Dataset
-                waveform_type = exact_waveforms ? Union{Float32,Float64} : AbstractFloat
+                waveform_type = preserve_waveform_type ? Union{Float32,Float64} : AbstractFloat
                 waveform = is_channel && key in ("signal", "rawdata") &&
                     eltype(child) <: waveform_type &&
                     !(haskey(attributes(child), "MATLAB_empty") &&
                       HDF5.read_attribute(child, "MATLAB_empty") != 0)
                 if waveform
                     value = read(child)
-                    if !exact_waveforms
+                    if !preserve_waveform_type
                         stored = Float32.(value)
                         any(i -> isfinite(value[i]) && !isfinite(stored[i]), eachindex(value)) &&
                             error("Float32 overflow in $child_path")
                         value = stored
                     end
-                    write_h5_array!(destination, key, value; exact_waveforms, array_options...)
+                    max_abs_error = 0.0
+                    if key == "signal" && quantization !== nothing
+                        max_abs_error = something(propose_compression_tolerance(source; quantization...), 0.0)
+                    end
+                    stored_bound = write_h5_array!(destination, key, value;
+                        preserve_waveform_type, max_abs_error, array_options...)
                     target = destination[key]
                     try
-                        copy_attributes!(target, child; float32 = !exact_waveforms)
+                        copy_attributes!(target, child; float32 = !preserve_waveform_type)
                     finally
                         close(target)
                     end
                     key == "signal" && push!(signal_paths, child_path)
+                    if key == "signal" && quantization !== nothing
+                        error_bounds[basename(path)] = stored_bound
+                    end
                 else
                     HDF5.copy_object(source, key, destination, key)
                     is_reference_dataset(child) && push!(references, child_path)
+                    if is_channel && key == "signal" && quantization !== nothing
+                        error_bounds[basename(path)] = 0.0
+                    end
                     if drop_rawdata && key == "save_rawdata"
                         # The flag describes the output, whose rawdata is absent.
                         target = destination[key]
@@ -392,21 +427,27 @@ Write a new .h5 file and return its path. For `measurement.mat`, the default
 destination is `output_directory/measurement.h5`. Set `file_as_folder=true`
 to write `output_directory/measurement/raw.h5`.
 
-Use `compression=:dictionary_delta` for bit-exact waveforms. Its defaults are
-`compression_level=7` and
-`target_chunk_bytes=8_000_000` (one million Float64 samples). Load `IVAnalysisTools`
-before opening the result with `h5read`. The legacy `:blosc`, `:deflate`, and
-`:none` modes default to `compression_level=5` and `target_chunk_bytes=1<<20`.
+Use `compression=:dictionary_delta` for bit-exact waveforms or
+`compression=:quantized_delta` for bounded-error compression. Both preserve
+the waveform type and shape, and default to `compression_level=7` and
+`target_chunk_bytes=8_000_000` (one million Float64 samples). The quantized
+mode uses `adc_lsb_volts=1/2400` and `noise_fraction=0.10` unless supplied.
+It uses lossless storage for raw waveforms and signals lacking a valid gain
+or decimation factor. Load `IVAnalysisTools` before reading with `h5read`.
+The legacy `:blosc`, `:deflate`, and `:none` modes default to
+`compression_level=5` and `target_chunk_bytes=1<<20`.
 `minimum_compression_bytes` defaults to 1024 for all modes.
 """
 function process_mat_file(
     mat_path::AbstractString,
     output_directory::AbstractString;
     compression::Symbol = :blosc,
-    compression_level::Integer = compression === :dictionary_delta ? 7 : 5,
+    compression_level::Integer = compression in (:dictionary_delta, :quantized_delta) ? 7 : 5,
     blosc_compressor::AbstractString = "blosclz",
-    target_chunk_bytes::Integer = compression === :dictionary_delta ? 8_000_000 : 1 << 20,
+    target_chunk_bytes::Integer = compression in (:dictionary_delta, :quantized_delta) ? 8_000_000 : 1 << 20,
     minimum_compression_bytes::Integer = 1024,
+    adc_lsb_volts::Real = DEFAULT_ADC_LSB_VOLTS,
+    noise_fraction::Real = DEFAULT_NOISE_FRACTION,
     file_as_folder::Bool = false,
     overwrite::Bool = false,
 )
@@ -415,10 +456,12 @@ function process_mat_file(
     target_chunk_bytes >= 1 || throw(ArgumentError("target_chunk_bytes must be positive."))
     minimum_compression_bytes >= 0 ||
         throw(ArgumentError("minimum_compression_bytes must be nonnegative."))
-    exact_waveforms = compression === :dictionary_delta
-    if exact_waveforms && target_chunk_bytes > MAX_DICTIONARY_CHUNK_BYTES
-        throw(ArgumentError("target_chunk_bytes exceeds the dictionary filter's 64 MiB limit."))
+    preserve_waveform_type = compression in (:dictionary_delta, :quantized_delta)
+    if preserve_waveform_type && target_chunk_bytes > MAX_DICTIONARY_CHUNK_BYTES
+        throw(ArgumentError("target_chunk_bytes exceeds the delta filters' 64 MiB limit."))
     end
+    quantization = compression === :quantized_delta ?
+        validate_quantization_options(adc_lsb_volts, noise_fraction) : nothing
     filters = compression_filters(compression; compression_level, blosc_compressor)
     stem = splitext(basename(mat_path))[1]
     output_path = file_as_folder ? joinpath(output_directory, stem, "raw.h5") :
@@ -440,8 +483,10 @@ function process_mat_file(
                 references = String[]
                 removed = String[]
                 signals = String[]
-                copy_tree!(destination, source, "/", references, removed, signals;
-                    exact_waveforms, filters, target_chunk_bytes, minimum_compression_bytes)
+                error_bounds = Dict{String,Float64}()
+                copy_tree!(destination, source, "/", references, removed, signals, error_bounds;
+                    preserve_waveform_type, quantization, filters, target_chunk_bytes,
+                    minimum_compression_bytes)
                 rebuild_references!(destination, source, references)
 
                 processing = create_group(destination, "compression_v2")
@@ -454,13 +499,26 @@ function process_mat_file(
                         write(processing, "blosc_compressor", String(blosc_compressor))
                     write(processing, "target_chunk_bytes", target_chunk_bytes)
                     write(processing, "minimum_compression_bytes", minimum_compression_bytes)
-                    write(processing, "waveform_type", exact_waveforms ? "source" : "Float32")
+                    write(processing, "waveform_type", preserve_waveform_type ? "source" : "Float32")
                     write(processing, "additional_decimation_samples", 1)
                     write(processing, "phase_alignment_applied", false)
                     write(processing, "removed_rawdata_count", length(removed))
                     write(processing, "signal_count", length(signals))
                     isempty(removed) || write(processing, "removed_rawdata_paths", removed)
                     isempty(signals) || write(processing, "signal_paths", signals)
+                    if quantization !== nothing
+                        write(processing, "adc_lsb_volts", quantization.adc_lsb_volts)
+                        write(processing, "noise_fraction", quantization.noise_fraction)
+                        write(processing, "decimation_filter", "hann_decimate")
+                        bounds = create_group(processing, "max_abs_error")
+                        try
+                            for (channel, bound) in error_bounds
+                                write(bounds, channel, bound)
+                            end
+                        finally
+                            close(bounds)
+                        end
+                    end
                 finally
                     close(processing)
                 end

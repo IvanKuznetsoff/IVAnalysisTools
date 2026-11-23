@@ -580,8 +580,8 @@ module IVAnalysisTools
     end
 
     include("compression.jl")
-    using .CompressV2: process_mat_file, process_mat_folder
+    using .CompressV2: process_mat_file, process_mat_folder, propose_compression_tolerance
 
     export blockmean, hann_decimate, initialize_phase, remove_offset!, remove_residual_resistance!, PairedArray, local_line, detect_edges, edge_local_fir
-    export process_mat_file, process_mat_folder
+    export process_mat_file, process_mat_folder, propose_compression_tolerance
 end
